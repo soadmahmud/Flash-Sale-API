@@ -5,7 +5,7 @@ namespace FlashSaleApi.Infrastructure.Redis;
 
 /// <summary>
 /// Central facade for all Redis interactions in the Flash Sale system.
-///
+
 /// Responsibilities:
 ///  • Stock management (atomic batch Lua-based decrement/increment)
 ///  • Cart storage per user (Redis Hash, 2-hour TTL + sale-end eviction)
