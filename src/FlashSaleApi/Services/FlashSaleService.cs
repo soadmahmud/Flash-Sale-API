@@ -54,6 +54,7 @@ public class FlashSaleService : IFlashSaleService
                 DiscountPrice:      p.DiscountPrice,
                 DiscountPercentage: discountPct,
                 StockRemaining:     Math.Max(0, stock),
+                MaxQuantityPerUser: p.MaxQuantityPerUser,
                 StartTime:          p.StartTime,
                 EndTime:            p.EndTime,
                 ImageUrl:           p.ImageUrl,

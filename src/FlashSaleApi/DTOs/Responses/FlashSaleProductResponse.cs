@@ -8,7 +8,8 @@ public record FlashSaleProductResponse(
     decimal OriginalPrice,
     decimal DiscountPrice,
     int DiscountPercentage,
-    long StockRemaining,  // live value from Redis
+    long StockRemaining,        // live value from Redis
+    int MaxQuantityPerUser,     // per-user purchase limit (displayed so clients can enforce client-side too)
     DateTime StartTime,
     DateTime EndTime,
     string? ImageUrl,

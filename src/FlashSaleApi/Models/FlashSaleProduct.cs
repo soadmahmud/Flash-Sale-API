@@ -24,6 +24,13 @@ public class FlashSaleProduct
     /// </summary>
     public int StockQuantity { get; set; }
 
+    /// <summary>
+    /// Maximum units a single user may purchase of this product during the flash sale.
+    /// Enforced in Redis before stock is decremented, protecting against bot/scalper abuse.
+    /// Defaults to 5 if not set explicitly.
+    /// </summary>
+    public int MaxQuantityPerUser { get; set; } = 5;
+
     public DateTime StartTime { get; set; }
 
     public DateTime EndTime { get; set; }

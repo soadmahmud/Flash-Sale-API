@@ -1,159 +1,102 @@
 # ⚡ Flash Sale API
 
-<p align="center">
-  <img src="https://img.shields.io/badge/ASP.NET%20Core-8.0-512BD4?logo=dotnet&logoColor=white" />
-  <img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white" />
-  <img src="https://img.shields.io/badge/Redis-7.x-DC382D?logo=redis&logoColor=white" />
-  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" />
-  <img src="https://img.shields.io/badge/Serilog-Enabled-purple" />
-  <img src="https://img.shields.io/badge/Swagger-OpenAPI%203.0-85EA2D?logo=swagger&logoColor=black" />
-</p>
-
-A **production-grade Flash Sale REST API** built with ASP.NET Core 8, designed to handle **100,000+ concurrent users** without overselling a single product unit.
+A **production-grade, high-throughput Flash Sale REST API** built with **ASP.NET Core 8**, **Redis**, and **PostgreSQL**. Designed to handle **100,000+ concurrent users** without overselling a single unit.
 
 ---
 
 ## 🏗️ Architecture Overview
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                         API Gateway                            │
-│                    (Rate Limiter: 10 req/10s)                  │
-└───────────────┬────────────────────────┬───────────────────────┘
-                │                        │
-   ┌────────────▼──────────┐  ┌──────────▼──────────────┐
-   │  FlashSaleController  │  │    OrderController        │
-   │  CartController       │  │  POST /api/orders         │
-   └────────────┬──────────┘  └──────────┬──────────────┘
-                │                        │
-   ┌────────────▼──────────┐  ┌──────────▼──────────────┐
-   │    Service Layer      │  │   OrderService            │
-   │  (Business Logic)     │  │ 1. Idempotency check      │
-   └────────────┬──────────┘  │ 2. Lua stock decrement    │
-                │             │ 3. Enqueue to Redis        │
-   ┌────────────▼──────────┐  │ 4. Return 202 Accepted    │
-   │   Repository Layer    │  └──────────┬──────────────┘
-   │   (EF Core + LINQ)    │             │
-   └────────────┬──────────┘  ┌──────────▼──────────────┐
-                │             │  OrderProcessingWorker    │
-   ┌────────────▼──────────┐  │  (IHostedService)         │
-   │     PostgreSQL 16     │  │  Dequeues → writes DB     │
-   │  Orders, Products,    │  │  → clears cart            │
-   │  OrderItems           │  └──────────┬──────────────┘
-   └───────────────────────┘             │
-                                ┌────────▼───────────────┐
-                                │         Redis           │
-                                │ • Stock counters        │
-                                │ • Cart hash (2hr TTL)   │
-                                │ • Order queue (FIFO)    │
-                                │ • Idempotency keys      │
-                                └────────────────────────┘
+Client (100k req/s)
+        │
+        ▼
+┌─────────────────────────┐
+│   ASP.NET Core 8 API    │  ← Rate Limiter, Idempotency Guard, Per-User Quota
+└──────────┬──────────────┘
+           │
+           ▼
+┌─────────────────────────┐
+│   Redis (Hot Path)       │  ← Atomic Lua batch decrement, Cart, Status, Quotas
+└──────────┬──────────────┘
+           │  (queue)
+           ▼
+┌─────────────────────────┐
+│  OrderProcessingWorker  │  ← BackgroundService drains queue → DB
+└──────────┬──────────────┘
+           │
+           ▼
+┌─────────────────────────┐
+│   PostgreSQL 16          │  ← Authoritative record, Unique constraint on IdempotencyKey
+└─────────────────────────┘
 ```
 
 ---
 
-## 🛡️ How Overselling is Prevented
+## 🔒 Concurrency & Anti-Oversell: 5 Layers of Protection
 
-This is the most critical design decision. Multiple layers work together:
-
-### Layer 1: Redis Lua Script (Atomic Stock Decrement)
-
-```lua
--- This entire script runs as ONE atomic operation in Redis.
--- No other command can execute between the GET and the DECRBY.
-local stock = tonumber(redis.call('GET', KEYS[1]))
-if stock == nil then return -1 end       -- product not seeded
-if stock < tonumber(ARGV[1]) then return -2 end  -- insufficient
-return redis.call('DECRBY', KEYS[1], ARGV[1])   -- decrement!
-```
-
-Without this script, thread A and thread B could both read `stock=1`, both pass the check, and both decrement — resulting in `stock=-1` (oversell). The Lua script makes the read-check-decrement an **indivisible unit**.
-
-### Layer 2: Idempotency Keys
-
-The client sends a unique `idempotencyKey` with every order. The API stores it in Redis with `SET NX` (set only if not exists). If the same key arrives again (network retry, accidental double-click), Redis returns 0 and the API returns **409 Conflict**.
-
-### Layer 3: Stock Rollback
-
-If stock decrement succeeds for product A, but product B has insufficient stock, all previously decremented quantities are **restored to Redis** before returning an error.
-
-### Layer 4: Unique DB Constraint
-
-The `IdempotencyKey` column in PostgreSQL has a `UNIQUE` index. Even if two requests slip through Redis, only one will succeed at the database level.
+| Layer | Mechanism | Fixes |
+|-------|-----------|-------|
+| **1. Batch Lua Script** | Single Redis script checks AND decrements ALL items atomically — zero ghost stock | Ghost Stock Bug |
+| **2. Idempotency Key** | Redis SET NX prevents duplicate order submissions | Duplicate orders |
+| **3. Per-User Quota** | Redis counter limits units per user per product (configurable) | Bot/scalper abuse |
+| **4. DB Unique Constraint** | `IdempotencyKey` is `UNIQUE` in PostgreSQL | Worker retry safety |
+| **5. Order Status Polling** | Redis status key tracks Queued→Processing→Confirmed/Failed for client feedback | False Promise Bug |
 
 ---
 
-## 📦 Project Structure
+## 🐛 Bugs Fixed (vs Original Design)
 
-```
-FlashSaleApi/
-├── src/
-│   └── FlashSaleApi/
-│       ├── Controllers/          # HTTP endpoint handlers
-│       │   ├── FlashSaleController.cs
-│       │   ├── CartController.cs
-│       │   └── OrderController.cs
-│       ├── Services/             # Business logic layer
-│       │   ├── Interfaces/
-│       │   ├── FlashSaleService.cs
-│       │   ├── CartService.cs
-│       │   └── OrderService.cs
-│       ├── Repositories/         # Data access layer (EF Core)
-│       │   ├── Interfaces/
-│       │   ├── FlashSaleRepository.cs
-│       │   └── OrderRepository.cs
-│       ├── Models/               # EF Core entity models
-│       ├── DTOs/                 # Request/Response data contracts
-│       │   ├── Requests/
-│       │   └── Responses/
-│       ├── Infrastructure/
-│       │   ├── Data/             # AppDbContext + migrations
-│       │   └── Redis/            # Redis service + Lua scripts
-│       ├── Workers/              # Background order processor
-│       ├── Middleware/           # Global exception handler
-│       ├── Program.cs            # DI wiring + startup
-│       └── appsettings.json
-├── Dockerfile                    # Multi-stage Docker build
-├── docker-compose.yml            # API + PostgreSQL + Redis
-└── README.md
-```
+### 🔴 Bug 1 — "Ghost Stock" (Partial Commit Race Condition) — **FIXED**
+
+**Problem:** The original design looped through items one-by-one and ran a separate Redis Lua script per item. If the pod crashed after decrementing Product A but before rolling back on Product B failure, Product A's stock was permanently lost.
+
+**Fix:** A single `DecrementStockBatch` Lua script is called with ALL items at once. It performs two passes:
+1. **Validate pass** — checks every item has sufficient stock (read-only, no side effects)
+2. **Decrement pass** — only runs if ALL validations pass
+
+Redis guarantees the entire script is atomic. No C# rollback needed.
 
 ---
 
-## 🚀 Quick Start
+### 🔴 Bug 2 — "False Promise" (Async Order Failure) — **FIXED**
 
-### Option A: Docker Compose (Recommended)
+**Problem:** The API returned `202 Accepted` but if the background worker's DB write failed, the user's order was silently dropped with no notification.
 
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/FlashSaleApi.git
-cd FlashSaleApi
+**Fix:** The worker writes explicit status transitions to Redis:
+- `Queued` → (worker picks up) → `Processing` → (DB write succeeds) → `Confirmed`
+- `Queued` → `Processing` → (DB write fails) → `Failed` (with reason)
 
-# Start all services (API + PostgreSQL + Redis)
-docker-compose up --build
+Clients poll `GET /api/orders/status/{orderId}` to get the real outcome.
 
-# API is now available at:
-# http://localhost:5000
-# Swagger UI: http://localhost:5000 (in Development mode)
-```
+---
 
-### Option B: Local Development
+### 🟠 Bug 3 — Incomplete Cart Invalidation — **FIXED**
 
-**Prerequisites:** .NET 8 SDK, PostgreSQL, Redis
+**Problem:** Cart TTL was a 2-hour absolute timeout. Items added shortly before a flash sale ended would stay in the cart long after the sale closed.
 
-```bash
-# 1. Set up the database
-# Update ConnectionStrings in appsettings.json
+**Fix:** Each cart item now stores the flash sale `EndTime` in the Redis Hash. `GetCart` calls `StripExpiredCartItemsAsync` which evicts any item whose sale has ended — regardless of the 2-hour TTL.
 
-# 2. Run migrations
-cd src/FlashSaleApi
-dotnet ef database update
+---
 
-# 3. Start the API
-dotnet run
+### 🟠 Bug 4 — Missing Per-User Purchase Limits — **FIXED**
 
-# Swagger UI → https://localhost:5001
-```
+**Problem:** A single user (or bot) could place an order for `quantity: 500` and wipe the entire inventory.
+
+**Fix:** Each `FlashSaleProduct` has a `MaxQuantityPerUser` field (configurable per product). Before stock is decremented, the API checks the user's Redis purchase counter (`quota:{userId}:{productId}`) and rejects if the limit would be exceeded.
+
+---
+
+### 🟠 Bug 5 — Price Discrepancy Risk — **Already Correct** ✅
+
+The price is locked at the moment the `202 Accepted` is returned. The `OrderQueuePayload` contains the `UnitPrice` captured at that instant. The background worker uses this locked price — it never re-reads from the database.
+
+---
+
+### 🟠 Bug 6 — Idempotency Key Rollback (No-op Bug) — **FIXED**
+
+**Problem:** On order failure, the code called `SetIdempotencyKeyAsync(key, 0)`. Since the key already existed, the `NX` condition prevented the write — making this a **no-op**. Users who hit a transient error could never retry with the same idempotency key.
+
+**Fix:** Added `DeleteIdempotencyKeyAsync` which calls Redis `KeyDeleteAsync`. On any order failure (before enqueue), the key is properly deleted so the user can safely retry.
 
 ---
 
@@ -161,61 +104,64 @@ dotnet run
 
 ### Flash Sale Products
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/flashsale/active` | List all active flash sale products |
-
-**Sample Response:**
-```json
-[
-  {
-    "id": 1,
-    "name": "Sony WH-1000XM5 Headphones",
-    "originalPrice": 399.99,
-    "discountPrice": 249.99,
-    "discountPercentage": 37,
-    "stockRemaining": 487,
-    "startTime": "2026-04-15T00:00:00Z",
-    "endTime": "2026-04-15T05:00:00Z",
-    "timeRemaining": "04:32:15"
-  }
-]
-```
-
----
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/api/flashsale/active` | List active products with live stock, discount %, and per-user purchase limit |
 
 ### Cart
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/cart/{userId}` | Get user's cart |
-| POST | `/api/cart` | Add item to cart |
-| DELETE | `/api/cart/{userId}/items/{productId}` | Remove single item |
-| DELETE | `/api/cart/{userId}` | Clear entire cart |
-
-**Headers required:** `X-User-Id: user123`
-
-**POST /api/cart body:**
-```json
-{
-  "productId": 1,
-  "quantity": 2
-}
-```
-
----
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/api/cart` | Add item to cart (validates active sale; stores sale EndTime for auto-eviction) |
+| `GET` | `/api/cart/{userId}` | View cart (auto-strips expired sale items) |
+| `DELETE` | `/api/cart/{userId}/items/{productId}` | Remove one item |
+| `DELETE` | `/api/cart/{userId}` | Clear entire cart |
 
 ### Orders
 
-| Method | Endpoint | Description |
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/api/orders` | Place order (202 Accepted, async processing) |
+| `GET` | `/api/orders/status/{orderId}` | **NEW** — Poll order status (Queued/Processing/Confirmed/Failed) |
+| `GET` | `/api/orders/{userId}` | Full order history from PostgreSQL |
+
+---
+
+## 🔄 Order Status Lifecycle
+
+```
+POST /api/orders
+       │
+       ▼ (Redis stock decremented atomically)
+   [Queued]  ◄── poll GET /api/orders/status/{orderId}
+       │
+       ▼ (worker picks up)
+ [Processing]
+       │
+       ├── DB write OK  ──► [Confirmed] ✅
+       │
+       └── DB write fails ─► [Failed] ❌ (stock compensated back)
+```
+
+> **Status keys expire after 24 hours.** After that, use `GET /api/orders/{userId}` for the permanent DB record.
+
+---
+
+## 🛡️ Request Headers
+
+| Header | Required | Description |
 |--------|----------|-------------|
-| POST | `/api/orders` | Place a flash sale order |
-| GET | `/api/orders/{userId}` | Get order history |
+| `X-User-Id` | Yes (for cart & orders) | User identifier |
+| `Content-Type` | Yes (POST) | `application/json` |
 
-**Headers required:** `X-User-Id: user123`
+---
 
-**POST /api/orders body:**
+## 📦 Place Order Request
+
 ```json
+POST /api/orders
+X-User-Id: user42
+
 {
   "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000",
   "items": [
@@ -225,112 +171,132 @@ dotnet run
 }
 ```
 
-**Response (202 Accepted):**
+**Response — 202 Accepted:**
 ```json
 {
-  "orderId": "7a9b3c1d-2e4f-5a6b-7c8d-9e0f1a2b3c4d",
-  "message": "Your order has been received and is being processed.",
-  "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000"
+  "orderId": "a1b2c3d4-...",
+  "message": "Your order has been received and is being processed. Poll the status URL to confirm.",
+  "idempotencyKey": "550e8400-...",
+  "statusPollUrl": "/api/orders/status/a1b2c3d4-..."
 }
 ```
 
 ---
 
-## ⚙️ Configuration
+## 🚀 Running the Project
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `ConnectionStrings:DefaultConnection` | PostgreSQL local | Database connection |
-| `ConnectionStrings:Redis` | `localhost:6379` | Redis connection |
-| `Serilog:MinimumLevel:Default` | `Information` | Log verbosity |
-
----
-
-## 🔄 Order Flow (Detailed)
-
-```
-Client → POST /api/orders
-    │
-    ├── [1] Validate request (items, quantities > 0, idempotencyKey present)
-    │
-    ├── [2] SET NX idempotency key in Redis
-    │       └── If already exists → 409 Conflict (duplicate request)
-    │
-    ├── [3] For each item:
-    │       ├── Load product from DB (validate active flash sale window)
-    │       └── Run Lua script: atomic Redis stock decrement
-    │               ├── Returns -1 → stock key missing → rollback + 409
-    │               ├── Returns -2 → out of stock   → rollback + 409
-    │               └── Returns N  → success, continue
-    │
-    ├── [4] Build OrderQueuePayload and LPUSH to Redis "order:queue"
-    │
-    └── [5] Return 202 Accepted { orderId, message }
-
-Background Worker (OrderProcessingWorker):
-    │
-    ├── RPOP from "order:queue"
-    ├── Write Order + OrderItems to PostgreSQL
-    ├── Update order status → Confirmed
-    ├── Clear user's cart from Redis (CART:{userId})
-    └── On failure: rollback stock in Redis + log for manual review
-```
-
----
-
-## 🔬 Load Testing
-
-Test the anti-oversell guarantee:
+### Docker (Recommended — zero config)
 
 ```bash
-# Install k6
-# Create test.js:
+git clone https://github.com/soadmahmud/Flash-Sale-API.git
+cd Flash-Sale-API
+docker-compose up --build
+# Swagger UI: http://localhost:5000
+```
 
-import http from 'k6/http';
-import { check } from 'k6';
+### Local (requires PostgreSQL + Redis)
 
-export const options = { vus: 1000, duration: '30s' };
+```bash
+export PATH="$PATH:/home/soadm/.dotnet:/home/soadm/.dotnet/tools"
+cd src/FlashSaleApi
 
-export default function () {
-  const res = http.post('http://localhost:5000/api/orders',
-    JSON.stringify({
-      idempotencyKey: `${__VU}-${__ITER}`,  // unique per virtual user + iteration
-      items: [{ productId: 1, quantity: 1 }]
-    }),
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Id': `user-${__VU}`
-      }
-    });
+# First run only: apply migrations
+DOTNET_ROOT=/home/soadm/.dotnet dotnet-ef database update
 
-  check(res, { 'status is 202 or 409': r => r.status === 202 || r.status === 409 });
-}
-
-# Run:
-k6 run test.js
-
-# After the test, verify Redis stock matches: (initial - successful 202 orders)
-redis-cli GET "stock:1"
+# Start
+dotnet run
+# Swagger: http://localhost:5000
 ```
 
 ---
 
-## 🧰 Tech Stack
+## 🗂️ Project Structure
 
-| Technology | Purpose |
-|------------|---------|
-| **ASP.NET Core 8** | Web API framework |
-| **Entity Framework Core 8** | ORM for PostgreSQL |
-| **Npgsql** | PostgreSQL EF Core provider |
-| **StackExchange.Redis** | Redis client |
-| **Serilog** | Structured logging (Console + File) |
-| **Swashbuckle** | Swagger / OpenAPI documentation |
-| **ASP.NET Rate Limiter** | Built-in fixed-window rate limiting |
-| **Docker + Compose** | Containerization |
+```
+/
+├── src/FlashSaleApi/
+│   ├── Controllers/         FlashSaleController, CartController, OrderController
+│   ├── Services/            FlashSaleService, CartService, OrderService + interfaces
+│   ├── Repositories/        FlashSaleRepository, OrderRepository + interfaces
+│   ├── Models/              FlashSaleProduct (+ MaxQuantityPerUser), Order, OrderItem
+│   ├── DTOs/                Requests & Responses (incl. OrderStatusResponse)
+│   ├── Infrastructure/
+│   │   ├── Data/            AppDbContext (EF Core + PostgreSQL)
+│   │   └── Redis/           RedisService, LuaScripts (DecrementStockBatch)
+│   ├── Workers/             OrderProcessingWorker (BackgroundService)
+│   ├── Middleware/          ExceptionHandlingMiddleware
+│   ├── Migrations/          EF Core migrations
+│   └── Program.cs
+├── Dockerfile               Multi-stage build (SDK → aspnet:8.0)
+├── docker-compose.yml       API + PostgreSQL 16 + Redis 7
+└── README.md
+```
 
 ---
 
-## 📝 License
+## ⚡ Performance Design
 
-MIT License — free to use and modify.
+| Hot Path Step | Where | Latency |
+|---|---|---|
+| Idempotency check | Redis SET NX | ~1ms |
+| Per-user quota check | Redis GET | ~1ms |
+| Per-user quota update | Redis INCR | ~1ms |
+| Batch stock decrement | Redis Lua script (single round-trip) | ~1ms |
+| Order status init | Redis HSET | ~1ms |
+| Enqueue | Redis LPUSH | ~1ms |
+| **Total HTTP response** | — | **~5–10ms** |
+
+DB write happens asynchronously in the background worker.
+
+---
+
+## 🧪 Sample cURL Commands
+
+```bash
+# 1. Get active flash sale products (with per-user limits)
+curl http://localhost:5000/api/flashsale/active
+
+# 2. Add to cart
+curl -X POST http://localhost:5000/api/cart \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: user42" \
+  -d '{"productId": 1, "quantity": 2}'
+
+# 3. Place order (multi-item)
+curl -X POST http://localhost:5000/api/orders \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: user42" \
+  -d '{
+    "idempotencyKey": "my-unique-key-001",
+    "items": [
+      {"productId": 1, "quantity": 1},
+      {"productId": 3, "quantity": 2}
+    ]
+  }'
+
+# 4. Poll order status (use orderId from step 3 response)
+curl http://localhost:5000/api/orders/status/{orderId}
+
+# 5. Order history
+curl http://localhost:5000/api/orders/user42
+```
+
+---
+
+## 🐳 docker-compose Services
+
+| Service | Image | Port |
+|---------|-------|------|
+| `api` | Built from `Dockerfile` | `5000` |
+| `db` | `postgres:16-alpine` | `5432` |
+| `redis` | `redis:7-alpine` | `6379` |
+
+---
+
+## 📋 Rate Limiting
+
+- **Policy:** Fixed Window — 10 requests per 10 seconds per IP address
+- **Applied to:** `POST /api/orders` only
+- **Response on exceed:** `429 Too Many Requests`
+
+> Per-user purchase quotas (bot protection) are **separate** from rate limiting and are enforced at the business logic level.

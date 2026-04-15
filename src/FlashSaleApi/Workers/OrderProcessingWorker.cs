@@ -15,11 +15,22 @@ namespace FlashSaleApi.Workers;
 /// This worker handles the slower PostgreSQL write in the background,
 /// decoupling request latency from database performance.
 ///
+/// FIX for "False Promise" bug:
+/// ─────────────────────────────
+/// The previous version silently dropped orders if the DB write failed —
+/// users who received 202 Accepted had no way to know their order failed.
+///
+/// This version writes explicit status transitions to Redis:
+///   Queued → Processing → Confirmed (success)
+///                       → Failed    (with reason)
+///
+/// Clients poll GET /api/orders/status/{orderId} to learn the true outcome.
+///
 /// Failure handling:
 /// ─────────────────
-/// If a DB write fails, the worker logs the error and increments the stock
-/// back in Redis (compensation / rollback). The order ID is logged so it can
-/// be re-processed manually or via a dead-letter queue.
+/// If a DB write fails, the worker logs the error, sets status "Failed" in Redis,
+/// and increments the stock back (compensation). The orderId is preserved in Redis
+/// so clients get a clear failure message rather than a hung "Pending" state.
 ///
 /// Scaling:
 /// ---------
@@ -87,6 +98,11 @@ public class OrderProcessingWorker : BackgroundService
 
     private async Task ProcessOrderAsync(OrderQueuePayload payload, CancellationToken ct)
     {
+        // ── FIX 2: Update status to "Processing" before starting DB write ────
+        // If the pod crashes here, the status stays "Processing" (not "Queued").
+        // The client's poll will surface this and the ops team can investigate.
+        await _redis.SetOrderStatusAsync(payload.OrderId, "Processing");
+
         // Create a new DI scope so we get a fresh DbContext for each order
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -106,7 +122,7 @@ public class OrderProcessingWorker : BackgroundService
                 {
                     ProductId = i.ProductId,
                     Quantity  = i.Quantity,
-                    UnitPrice = i.UnitPrice
+                    UnitPrice = i.UnitPrice   // price was locked at order ingestion time
                 }).ToList()
             };
 
@@ -116,16 +132,26 @@ public class OrderProcessingWorker : BackgroundService
             // Clear the user's cart now that order is confirmed
             await _redis.ClearCartAsync(payload.UserId);
 
+            // ── FIX 2: Mark order as Confirmed in Redis ───────────────────────
+            await _redis.SetOrderStatusAsync(payload.OrderId, "Confirmed");
+
             _logger.LogInformation("Order {OrderId} confirmed and persisted to DB", payload.OrderId);
         }
         catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
             // Idempotency: order already exists in DB (e.g. worker restarted mid-write)
             _logger.LogWarning("Order {OrderId} already exists in DB. Skipping duplicate write.", payload.OrderId);
+            await _redis.SetOrderStatusAsync(payload.OrderId, "Confirmed");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to persist order {OrderId}. Rolling back Redis stock...", payload.OrderId);
+
+            // ── FIX 2: Mark order as Failed with reason ────────────────────────
+            // The user will see this when they poll GET /api/orders/status/{orderId}
+            // instead of receiving a silent failure while thinking their order is confirmed.
+            var failureReason = $"Database write failed: {ex.Message}";
+            await _redis.SetOrderStatusAsync(payload.OrderId, "Failed", failureReason);
 
             // Compensate: restore stock for each item
             foreach (var item in payload.Items)

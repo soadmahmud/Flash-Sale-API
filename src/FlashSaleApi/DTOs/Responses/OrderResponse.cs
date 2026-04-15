@@ -24,5 +24,18 @@ public record OrderItemResponse(
 public record OrderAcceptedResponse(
     Guid OrderId,
     string Message,
-    string IdempotencyKey
+    string IdempotencyKey,
+    string StatusPollUrl
+);
+
+/// <summary>
+/// Real-time order status response for the polling endpoint.
+/// Backed by a Redis key with 24h TTL — no database hit required.
+/// Clients poll GET /api/orders/status/{orderId} until Status is "Confirmed" or "Failed".
+/// </summary>
+public record OrderStatusResponse(
+    Guid OrderId,
+    string Status,
+    string? FailureReason,
+    DateTime LastUpdatedAt
 );

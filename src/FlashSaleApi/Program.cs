@@ -166,7 +166,10 @@ try
     app.UseGlobalExceptionHandling();     // 1st: catch all unhandled exceptions
     app.UseSerilogRequestLogging();       // log every HTTP request
 
-    if (app.Environment.IsDevelopment())
+    // Enable Swagger in all environments for this demo project.
+    // In a production deployment, add "Swagger:Enabled": false to appsettings.Production.json
+    var swaggerEnabled = app.Configuration.GetValue("Swagger:Enabled", defaultValue: true);
+    if (swaggerEnabled)
     {
         app.UseSwagger();
         app.UseSwaggerUI(c =>

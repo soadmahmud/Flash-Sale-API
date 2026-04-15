@@ -7,31 +7,49 @@ namespace FlashSaleApi.Infrastructure.Redis;
 /// Central facade for all Redis interactions in the Flash Sale system.
 ///
 /// Responsibilities:
-///  • Stock management (atomic Lua-based decrement/increment)
-///  • Cart storage per user (Redis Hash, 2-hour TTL)
+///  • Stock management (atomic batch Lua-based decrement/increment)
+///  • Cart storage per user (Redis Hash, 2-hour TTL + sale-end eviction)
 ///  • Order queue (Redis List used as a FIFO queue)
+///  • Order status tracking (Redis Hash with 24h TTL for client polling)
 ///  • Idempotency key management (SET NX pattern)
+///  • Per-user purchase quota tracking (Redis counter per user+product)
 /// </summary>
 public interface IRedisService
 {
     // ── Stock ───────────────────────────────────────────────────────────────
-    Task<long> DecrementStockAsync(int productId, int quantity);
+    /// <summary>
+    /// Atomically checks and decrements stock for ALL items in a single Lua call.
+    /// Returns (true, _) on success; (false, failedProductId) if any item fails.
+    /// </summary>
+    Task<(bool Success, int FailedProductId, string FailureReason)> DecrementStockBatchAsync(
+        IReadOnlyList<(int ProductId, int Quantity)> items);
+
     Task SetStockAsync(int productId, int quantity);
     Task<long?> GetStockAsync(int productId);
-    Task IncrementStockAsync(int productId, int quantity); // compensate on failure
+    Task IncrementStockAsync(int productId, int quantity);
 
     // ── Cart ────────────────────────────────────────────────────────────────
-    Task SetCartItemAsync(string userId, int productId, int quantity);
-    Task<Dictionary<int, int>> GetCartAsync(string userId);
+    Task SetCartItemAsync(string userId, int productId, int quantity, DateTime saleEndTime);
+    Task<Dictionary<int, (int Quantity, DateTime SaleEndTime)>> GetCartAsync(string userId);
     Task RemoveCartItemAsync(string userId, int productId);
     Task ClearCartAsync(string userId);
+    Task StripExpiredCartItemsAsync(string userId);
 
     // ── Order Queue ──────────────────────────────────────────────────────────
     Task EnqueueOrderAsync<T>(T payload);
     Task<T?> DequeueOrderAsync<T>(CancellationToken ct);
 
+    // ── Order Status ─────────────────────────────────────────────────────────
+    Task SetOrderStatusAsync(Guid orderId, string status, string? failureReason = null);
+    Task<(string? Status, string? FailureReason, DateTime LastUpdatedAt)> GetOrderStatusAsync(Guid orderId);
+
     // ── Idempotency ──────────────────────────────────────────────────────────
     Task<bool> SetIdempotencyKeyAsync(string key, int ttlSeconds = 86400);
+    Task DeleteIdempotencyKeyAsync(string key);
+
+    // ── Per-User Purchase Quota ───────────────────────────────────────────────
+    Task<long> GetUserPurchasedQtyAsync(string userId, int productId);
+    Task IncrementUserPurchasedQtyAsync(string userId, int productId, int quantity, TimeSpan ttl);
 }
 
 public class RedisService : IRedisService
@@ -40,10 +58,13 @@ public class RedisService : IRedisService
     private readonly ILogger<RedisService> _logger;
 
     // Key prefix constants keep keys consistent across the application
-    private const string StockKeyPrefix      = "stock:";
-    private const string CartKeyPrefix       = "cart:";
-    private const string OrderQueueKey       = "order:queue";
-    private const string IdempotencyPrefix   = "idem:";
+    private const string StockKeyPrefix        = "stock:";
+    private const string CartKeyPrefix         = "cart:";
+    private const string CartEndTimeField      = "__sale_end__:";   // field suffix in cart hash
+    private const string OrderQueueKey         = "order:queue";
+    private const string OrderStatusKeyPrefix  = "order:status:";
+    private const string IdempotencyPrefix     = "idem:";
+    private const string UserQuotaKeyPrefix    = "quota:";          // quota:{userId}:{productId}
 
     public RedisService(IConnectionMultiplexer redis, ILogger<RedisService> logger)
     {
@@ -54,20 +75,45 @@ public class RedisService : IRedisService
     // ── Stock ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Atomically decrements Redis stock using Lua script.
-    /// Returns the remaining stock, or a negative sentinel:
-    ///   -1 = key not found (product not seeded)
-    ///   -2 = insufficient stock
+    /// Atomically checks and decrements stock for ALL items in a single Lua script call.
+    ///
+    /// FIX for "Ghost Stock" bug:
+    /// The previous implementation looped through items one-by-one and relied on C# to
+    /// rollback already-decremented items if a later item failed. If the pod crashed between
+    /// decrement and rollback, that stock was permanently lost.
+    ///
+    /// This implementation uses a two-pass Lua script: validate all → decrement all.
+    /// Because it's a single Redis Lua execution, it is fully atomic — either everything
+    /// succeeds or nothing changes.
     /// </summary>
-    public async Task<long> DecrementStockAsync(int productId, int quantity)
+    public async Task<(bool Success, int FailedProductId, string FailureReason)> DecrementStockBatchAsync(
+        IReadOnlyList<(int ProductId, int Quantity)> items)
     {
-        var key = StockKeyPrefix + productId;
-        var result = await _db.ScriptEvaluateAsync(
-            LuaScripts.DecrementStock,
-            new RedisKey[] { key },
-            new RedisValue[] { quantity });
+        var keys = items.Select(i => (RedisKey)(StockKeyPrefix + i.ProductId)).ToArray();
 
-        return (long)result;
+        // ARGV: quantities[1..N] then N itself (so Lua knows where quantities end)
+        var args = items
+            .Select(i => (RedisValue)i.Quantity)
+            .Append((RedisValue)items.Count)
+            .ToArray();
+
+        var result = (RedisValue[])(await _db.ScriptEvaluateAsync(
+            LuaScripts.DecrementStockBatch,
+            keys,
+            args))!;
+
+        var code = (long)result[0];
+
+        if (code == 1)
+            return (true, 0, string.Empty);
+
+        // result[1] is the 1-based index of the failing item
+        var failIndex = (int)(long)result[1] - 1;
+        var failedProductId = items[failIndex].ProductId;
+        var reason = code == -1 ? "Stock key not found in Redis" : "Insufficient stock";
+
+        _logger.LogWarning("Batch stock decrement failed for product {ProductId}: {Reason}", failedProductId, reason);
+        return (false, failedProductId, reason);
     }
 
     public async Task SetStockAsync(int productId, int quantity)
@@ -87,36 +133,111 @@ public class RedisService : IRedisService
     public async Task IncrementStockAsync(int productId, int quantity)
     {
         await _db.StringIncrementAsync(StockKeyPrefix + productId, quantity);
-        _logger.LogWarning("Compensated stock for product {ProductId} by {Quantity}", productId, quantity);
+        _logger.LogWarning("Compensated stock for product {ProductId} by +{Quantity}", productId, quantity);
     }
 
     // ── Cart ──────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// Stores a cart item in a Redis Hash keyed by userId.
-    /// The hash field is the productId; the value is the quantity.
+    /// Field: productId → quantity
+    /// Field: __sale_end__:{productId} → UTC ticks of flash sale end time
+    ///
+    /// Storing the sale end time alongside the quantity enables active cart invalidation
+    /// when the flash sale window closes, not just TTL-based expiry.
     /// TTL is reset to 2 hours on every write.
     /// </summary>
-    public async Task SetCartItemAsync(string userId, int productId, int quantity)
+    public async Task SetCartItemAsync(string userId, int productId, int quantity, DateTime saleEndTime)
     {
         var cartKey = CartKeyPrefix + userId;
+        // Store the quantity and sale end time in the same hash
         await _db.HashSetAsync(cartKey, productId.ToString(), quantity);
+        await _db.HashSetAsync(cartKey, CartEndTimeField + productId, saleEndTime.Ticks.ToString());
+        // Reset the 2-hour absolute TTL on every write
         await _db.KeyExpireAsync(cartKey, TimeSpan.FromHours(2));
     }
 
-    public async Task<Dictionary<int, int>> GetCartAsync(string userId)
+    /// <summary>
+    /// Returns all cart items as {ProductId → (Quantity, SaleEndTime)}.
+    /// Skips internal metadata fields (sale_end__ prefixed).
+    /// </summary>
+    public async Task<Dictionary<int, (int Quantity, DateTime SaleEndTime)>> GetCartAsync(string userId)
     {
         var entries = await _db.HashGetAllAsync(CartKeyPrefix + userId);
-        return entries.ToDictionary(
-            e => int.Parse(e.Name!),
-            e => (int)e.Value);
+        var result = new Dictionary<int, (int, DateTime)>();
+
+        // Build a lookup of end times first
+        var endTimes = new Dictionary<int, DateTime>();
+        foreach (var entry in entries)
+        {
+            var name = entry.Name.ToString();
+            if (name.StartsWith(CartEndTimeField))
+            {
+                if (int.TryParse(name[CartEndTimeField.Length..], out var pid) &&
+                    long.TryParse(entry.Value.ToString(), out var ticks))
+                {
+                    endTimes[pid] = new DateTime(ticks, DateTimeKind.Utc);
+                }
+            }
+        }
+
+        foreach (var entry in entries)
+        {
+            var name = entry.Name.ToString();
+            if (name.StartsWith(CartEndTimeField)) continue; // skip metadata fields
+
+            if (int.TryParse(name, out var productId) && int.TryParse(entry.Value.ToString(), out var qty))
+            {
+                var endTime = endTimes.GetValueOrDefault(productId, DateTime.MaxValue);
+                result[productId] = (qty, endTime);
+            }
+        }
+
+        return result;
     }
 
     public async Task RemoveCartItemAsync(string userId, int productId)
-        => await _db.HashDeleteAsync(CartKeyPrefix + userId, productId.ToString());
+    {
+        var cartKey = CartKeyPrefix + userId;
+        await _db.HashDeleteAsync(cartKey, productId.ToString());
+        await _db.HashDeleteAsync(cartKey, CartEndTimeField + productId);
+    }
 
     public async Task ClearCartAsync(string userId)
         => await _db.KeyDeleteAsync(CartKeyPrefix + userId);
+
+    /// <summary>
+    /// FIX for "Incomplete Cart Invalidation" bug:
+    /// Scans all cart items and removes any whose flash sale EndTime has passed.
+    /// Called on every GetCart to keep the cart clean without a separate background job.
+    /// </summary>
+    public async Task StripExpiredCartItemsAsync(string userId)
+    {
+        var cartKey = CartKeyPrefix + userId;
+        var entries = await _db.HashGetAllAsync(cartKey);
+        var now = DateTime.UtcNow;
+
+        foreach (var entry in entries)
+        {
+            var name = entry.Name.ToString();
+            if (!name.StartsWith(CartEndTimeField)) continue;
+
+            if (int.TryParse(name[CartEndTimeField.Length..], out var productId) &&
+                long.TryParse(entry.Value.ToString(), out var ticks))
+            {
+                var endTime = new DateTime(ticks, DateTimeKind.Utc);
+                if (endTime < now)
+                {
+                    // Sale ended — remove item and its metadata from cart
+                    await _db.HashDeleteAsync(cartKey, productId.ToString());
+                    await _db.HashDeleteAsync(cartKey, CartEndTimeField + productId);
+                    _logger.LogInformation(
+                        "Stripped expired cart item: user={UserId} product={ProductId} (sale ended {EndTime})",
+                        userId, productId, endTime);
+                }
+            }
+        }
+    }
 
     // ── Order Queue ────────────────────────────────────────────────────────────
 
@@ -131,19 +252,55 @@ public class RedisService : IRedisService
     }
 
     /// <summary>
-    /// Blocks for up to 5 seconds waiting for an item on the queue (BRPOP).
-    /// Returns null if nothing arrives within the timeout.
-    /// This prevents the worker from busy-spinning when the queue is empty.
+    /// Pops one item from the right end of the queue (FIFO).
+    /// Returns null if the queue is empty.
     /// </summary>
     public async Task<T?> DequeueOrderAsync<T>(CancellationToken ct)
     {
-        // BRPOP returns [key, value]; we want index 1
         var result = await _db.ListRightPopAsync(OrderQueueKey);
-
         if (result.IsNullOrEmpty)
             return default;
 
         return JsonSerializer.Deserialize<T>(result!);
+    }
+
+    // ── Order Status ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// FIX for "False Promise" bug:
+    /// Writes the order processing status to a Redis Hash so clients can poll.
+    /// Key: order:status:{orderId}
+    /// Fields: status, failureReason, updatedAt
+    /// TTL: 24 hours (enough time for the client to poll the result)
+    /// </summary>
+    public async Task SetOrderStatusAsync(Guid orderId, string status, string? failureReason = null)
+    {
+        var key = OrderStatusKeyPrefix + orderId;
+        var fields = new HashEntry[]
+        {
+            new("status",        status),
+            new("failureReason", failureReason ?? string.Empty),
+            new("updatedAt",     DateTime.UtcNow.ToString("O"))
+        };
+        await _db.HashSetAsync(key, fields);
+        await _db.KeyExpireAsync(key, TimeSpan.FromHours(24));
+    }
+
+    public async Task<(string? Status, string? FailureReason, DateTime LastUpdatedAt)> GetOrderStatusAsync(Guid orderId)
+    {
+        var key = OrderStatusKeyPrefix + orderId;
+        var fields = await _db.HashGetAllAsync(key);
+
+        if (fields.Length == 0)
+            return (null, null, default);
+
+        var dict = fields.ToDictionary(f => f.Name.ToString(), f => f.Value.ToString());
+        dict.TryGetValue("status", out var status);
+        dict.TryGetValue("failureReason", out var failureReason);
+        dict.TryGetValue("updatedAt", out var updatedAtStr);
+
+        DateTime.TryParse(updatedAtStr, out var updatedAt);
+        return (status, failureReason, updatedAt);
     }
 
     // ── Idempotency ────────────────────────────────────────────────────────────
@@ -162,5 +319,44 @@ public class RedisService : IRedisService
             new RedisValue[] { ttlSeconds });
 
         return (long)result == 1;
+    }
+
+    /// <summary>
+    /// FIX for idempotency rollback bug:
+    /// The previous code called SetIdempotencyKeyAsync(key, 0) on failure, but since the
+    /// key already existed, the NX condition prevented it from updating, making it a no-op.
+    /// This method properly deletes the key so the user can retry after a transient failure.
+    /// </summary>
+    public async Task DeleteIdempotencyKeyAsync(string key)
+    {
+        var redisKey = IdempotencyPrefix + key;
+        await _db.KeyDeleteAsync(redisKey);
+        _logger.LogInformation("Released idempotency key: {Key}", redisKey);
+    }
+
+    // ── Per-User Purchase Quota ────────────────────────────────────────────────
+
+    /// <summary>
+    /// FIX for "Missing Purchase Limits" bug:
+    /// Returns how many units the given user has already purchased of a product
+    /// during the current flash sale. Tracked in Redis to avoid DB lookups on the hot path.
+    /// Key: quota:{userId}:{productId}
+    /// </summary>
+    public async Task<long> GetUserPurchasedQtyAsync(string userId, int productId)
+    {
+        var key = UserQuotaKeyPrefix + userId + ":" + productId;
+        var val = await _db.StringGetAsync(key);
+        return val.HasValue ? (long)val : 0L;
+    }
+
+    /// <summary>
+    /// Increments the user's purchase counter after a successful stock decrement.
+    /// TTL is set to the flash sale end time so the quota auto-expires with the sale.
+    /// </summary>
+    public async Task IncrementUserPurchasedQtyAsync(string userId, int productId, int quantity, TimeSpan ttl)
+    {
+        var key = UserQuotaKeyPrefix + userId + ":" + productId;
+        await _db.StringIncrementAsync(key, quantity);
+        await _db.KeyExpireAsync(key, ttl);
     }
 }

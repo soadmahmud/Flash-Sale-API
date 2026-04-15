@@ -19,25 +19,47 @@ namespace FlashSaleApi.Infrastructure.Redis;
 public static class LuaScripts
 {
     /// <summary>
-    /// Atomically checks stock and decrements if sufficient.
+    /// BATCH atomic stock check-and-decrement for multiple products in a single
+    /// Redis round-trip. Fixes the "Ghost Stock" bug where a per-item loop could
+    /// partially commit, then crash before the C# rollback executes.
     ///
-    /// KEYS[1]  → Redis key for the product's stock, e.g. "stock:42"
-    /// ARGV[1]  → quantity requested (as string)
+    /// Protocol:
+    ///   KEYS[1..N]  → Redis stock keys  (e.g. "stock:1", "stock:2", ...)
+    ///   ARGV[1..N]  → quantities requested (matching KEYS indices)
+    ///   ARGV[N+1]   → N (number of items) passed explicitly so Lua knows the split
+    ///
+    /// Algorithm:
+    ///   Pass 1 — validate ALL items have sufficient stock (read-only, touches nothing)
+    ///   Pass 2 — decrement ALL items (only reached if pass 1 fully succeeds)
     ///
     /// Return values:
-    ///   -1  → key does not exist (product not seeded or already fully depleted)
-    ///   -2  → insufficient stock (requested > available)
-    ///    N  → remaining stock after decrement (N >= 0)
+    ///   { 1 }         → all decremented successfully
+    ///   { -1, idx }   → KEYS[idx] does not exist in Redis
+    ///   { -2, idx }   → KEYS[idx] has insufficient stock
+    ///
+    /// Because both passes run inside a single Lua script, Redis guarantees
+    /// atomicity: no other client can read or write those keys in between.
     /// </summary>
-    public const string DecrementStock = @"
-local stock = tonumber(redis.call('GET', KEYS[1]))
-if stock == nil then
-    return -1
+    public const string DecrementStockBatch = @"
+local n = tonumber(ARGV[#ARGV])
+
+-- Pass 1: validate all items (read-only, no side effects)
+for i = 1, n do
+    local stock = tonumber(redis.call('GET', KEYS[i]))
+    if stock == nil then
+        return { -1, i }
+    end
+    if stock < tonumber(ARGV[i]) then
+        return { -2, i }
+    end
 end
-if stock < tonumber(ARGV[1]) then
-    return -2
+
+-- Pass 2: decrement all items (all validations passed)
+for i = 1, n do
+    redis.call('DECRBY', KEYS[i], ARGV[i])
 end
-return redis.call('DECRBY', KEYS[1], ARGV[1])
+
+return { 1 }
 ";
 
     /// <summary>
