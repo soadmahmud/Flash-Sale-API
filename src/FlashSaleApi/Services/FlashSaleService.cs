@@ -2,6 +2,7 @@ using FlashSaleApi.DTOs.Responses;
 using FlashSaleApi.Infrastructure.Redis;
 using FlashSaleApi.Repositories.Interfaces;
 using FlashSaleApi.Services.Interfaces;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace FlashSaleApi.Services;
 
@@ -19,28 +20,45 @@ public class FlashSaleService : IFlashSaleService
 {
     private readonly IFlashSaleRepository _repo;
     private readonly IRedisService _redis;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<FlashSaleService> _logger;
 
     public FlashSaleService(
         IFlashSaleRepository repo,
         IRedisService redis,
+        IMemoryCache cache,
         ILogger<FlashSaleService> logger)
     {
         _repo = repo;
         _redis = redis;
+        _cache = cache;
         _logger = logger;
     }
 
     public async Task<IEnumerable<FlashSaleProductResponse>> GetActiveProductsAsync()
     {
-        var products = await _repo.GetActiveProductsAsync();
-        var now = DateTime.UtcNow;
-        var responses = new List<FlashSaleProductResponse>();
-
-        foreach (var p in products)
+        // FIX for SQA Architecture Review Issue #3 (Missing Caching Layer):
+        // Caching the DB-driven product catalog for 10 seconds prevents PostgreSQL 
+        // from being overwhelmed by 100k users concurrently hitting this endpoint. 
+        var products = await _cache.GetOrCreateAsync("ActiveProductsCatalog", entry =>
         {
-            // Fetch live stock from Redis (never from DB for performance)
-            var stock = await _redis.GetStockAsync(p.Id) ?? 0L;
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(10);
+            return _repo.GetActiveProductsAsync();
+        });
+
+        if (products is null) return Array.Empty<FlashSaleProductResponse>();
+
+        var productsList = products.ToList();
+        var now = DateTime.UtcNow;
+        var responses = new List<FlashSaleProductResponse>(productsList.Count);
+
+        // Fetch live stock from Redis using a single batched MGET (optimization)
+        var stockValues = await _redis.GetStocksAsync(productsList.Select(p => p.Id));
+
+        for (int i = 0; i < productsList.Count; i++)
+        {
+            var p = productsList[i];
+            var stock = stockValues[i] ?? 0L;
 
             var discountPct = p.OriginalPrice > 0
                 ? (int)Math.Round((1 - p.DiscountPrice / p.OriginalPrice) * 100)

@@ -26,6 +26,7 @@ public interface IRedisService
 
     Task SetStockAsync(int productId, int quantity);
     Task<long?> GetStockAsync(int productId);
+    Task<long?[]> GetStocksAsync(IEnumerable<int> productIds);
     Task IncrementStockAsync(int productId, int quantity);
 
     // ── Cart ────────────────────────────────────────────────────────────────
@@ -50,6 +51,7 @@ public interface IRedisService
     // ── Per-User Purchase Quota ───────────────────────────────────────────────
     Task<long> GetUserPurchasedQtyAsync(string userId, int productId);
     Task IncrementUserPurchasedQtyAsync(string userId, int productId, int quantity, TimeSpan ttl);
+    Task DecrementUserPurchasedQtyAsync(string userId, int productId, int quantity);
 }
 
 public class RedisService : IRedisService
@@ -127,6 +129,13 @@ public class RedisService : IRedisService
     {
         var val = await _db.StringGetAsync(StockKeyPrefix + productId);
         return val.HasValue ? (long?)val : null;
+    }
+
+    public async Task<long?[]> GetStocksAsync(IEnumerable<int> productIds)
+    {
+        var keys = productIds.Select(id => (RedisKey)(StockKeyPrefix + id)).ToArray();
+        var vals = await _db.StringGetAsync(keys);
+        return vals.Select(v => v.HasValue ? (long?)v : null).ToArray();
     }
 
     /// <summary>Compensate stock on worker processing failure (rollback).</summary>
@@ -358,5 +367,14 @@ public class RedisService : IRedisService
         var key = UserQuotaKeyPrefix + userId + ":" + productId;
         await _db.StringIncrementAsync(key, quantity);
         await _db.KeyExpireAsync(key, ttl);
+    }
+
+    /// <summary>
+    /// Decrements the user's purchase counter. Used in DB rollbacks.
+    /// </summary>
+    public async Task DecrementUserPurchasedQtyAsync(string userId, int productId, int quantity)
+    {
+        var key = UserQuotaKeyPrefix + userId + ":" + productId;
+        await _db.StringDecrementAsync(key, quantity);
     }
 }

@@ -129,8 +129,11 @@ public class OrderProcessingWorker : BackgroundService
             db.Orders.Add(order);
             await db.SaveChangesAsync(ct);
 
-            // Clear the user's cart now that order is confirmed
-            await _redis.ClearCartAsync(payload.UserId);
+            // Clear only the specific items purchased from the user's cart
+            foreach (var item in payload.Items)
+            {
+                await _redis.RemoveCartItemAsync(payload.UserId, item.ProductId);
+            }
 
             // ── FIX 2: Mark order as Confirmed in Redis ───────────────────────
             await _redis.SetOrderStatusAsync(payload.OrderId, "Confirmed");
@@ -153,11 +156,12 @@ public class OrderProcessingWorker : BackgroundService
             var failureReason = $"Database write failed: {ex.Message}";
             await _redis.SetOrderStatusAsync(payload.OrderId, "Failed", failureReason);
 
-            // Compensate: restore stock for each item
+            // Compensate: restore stock for each item and refund their purchase quota
             foreach (var item in payload.Items)
             {
                 await _redis.IncrementStockAsync(item.ProductId, item.Quantity);
-                _logger.LogWarning("Compensated stock: product {ProductId} +{Qty}", item.ProductId, item.Quantity);
+                await _redis.DecrementUserPurchasedQtyAsync(payload.UserId, item.ProductId, item.Quantity);
+                _logger.LogWarning("Compensated stock & quota: product {ProductId} +{Qty} for user {UserId}", item.ProductId, item.Quantity, payload.UserId);
             }
         }
     }

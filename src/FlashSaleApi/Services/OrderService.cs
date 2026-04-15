@@ -87,9 +87,15 @@ public class OrderService : IOrderService
             var orderItems = new List<OrderQueueItem>();
             decimal totalAmount = 0;
 
+            // FIX 1: Aggregate duplicate products to prevent Lua bypass
+            var consolidatedItems = request.Items
+                .GroupBy(i => i.ProductId)
+                .Select(g => new OrderItemRequest(g.Key, g.Sum(x => x.Quantity)))
+                .ToList();
+
             // Load all product metadata in advance (before touching Redis stock)
             var productLookup = new Dictionary<int, FlashSaleProduct>();
-            foreach (var item in request.Items)
+            foreach (var item in consolidatedItems)
             {
                 if (item.Quantity <= 0)
                     throw new ArgumentException($"Quantity for product {item.ProductId} must be > 0.");
@@ -121,7 +127,7 @@ public class OrderService : IOrderService
             // FIX 1 (Ghost Stock): Both validation AND decrement happen inside one
             // Lua script. If any product is out of stock, ZERO keys are modified.
             // There is no C# rollback needed — Redis guarantees atomicity.
-            var stockItems = request.Items
+            var stockItems = consolidatedItems
                 .Select(i => (i.ProductId, i.Quantity))
                 .ToList();
 
@@ -136,7 +142,7 @@ public class OrderService : IOrderService
             }
 
             // ── Step 5: Increment per-user quota counters ─────────────────────
-            foreach (var item in request.Items)
+            foreach (var item in consolidatedItems)
             {
                 var product = productLookup[item.ProductId];
                 var saleDuration = product.EndTime - now;
