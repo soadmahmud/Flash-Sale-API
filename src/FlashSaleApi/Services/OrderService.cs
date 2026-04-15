@@ -10,7 +10,7 @@ namespace FlashSaleApi.Services;
 
 /// <summary>
 /// Orchestrates the high-throughput order placement flow.
-///
+
 /// Order Placement Flow (step by step):
 /// ──────────────────────────────────────
 ///  1. Validate request (products are active, quantities > 0)
@@ -21,7 +21,7 @@ namespace FlashSaleApi.Services;
 ///  6. Write initial "Queued" status to Redis for client polling
 ///  7. Build an OrderQueuePayload and push it to Redis queue
 ///  8. Return 202 Accepted immediately (no DB write on the hot path)
-///
+
 /// The background worker (OrderProcessingWorker) handles step 9:
 ///  9. Dequeue payload → persist Order + OrderItems to PostgreSQL
 ///     → update Redis status to Confirmed/Failed → clear user cart

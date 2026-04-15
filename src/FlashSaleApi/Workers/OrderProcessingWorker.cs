@@ -8,7 +8,7 @@ namespace FlashSaleApi.Workers;
 /// <summary>
 /// Background worker that continuously drains the Redis order queue
 /// and persists orders to PostgreSQL.
-///
+
 /// Why a separate worker?
 /// ──────────────────────
 /// The HTTP request handler returns 202 Accepted in &lt; 10ms.
