@@ -1,6 +1,6 @@
 # ⚡ Flash Sale API
 
-A **production-grade, high-throughput Flash Sale REST API** built with **ASP.NET Core 8**, **Redis**, and **PostgreSQL**. Designed to handle **100,000+ concurrent users** without overselling a single unit.
+A **production-grade, high-throughput Flash Sale REST API** built with **ASP.NET Core 8**, **Redis**, and **PostgreSQL**. Designed to handle **100000+ concurrent users** without overselling a single unit.
 
 ---
 
