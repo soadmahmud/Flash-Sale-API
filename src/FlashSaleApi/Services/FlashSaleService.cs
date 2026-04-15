@@ -8,7 +8,7 @@ namespace FlashSaleApi.Services;
 
 /// <summary>
 /// Handles flash sale product listing and Redis stock seeding.
-///
+
 /// Stock seeding strategy:
 /// ──────────────────────
 /// On application startup, all product stock values are written to Redis.
